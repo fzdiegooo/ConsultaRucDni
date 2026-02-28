@@ -1,0 +1,7 @@
+services:
+  consulta-ruc:
+    build: .
+    container_name: consulta-ruc
+    ports:
+      - "4000:4000"
+    restart: unless-stopped
