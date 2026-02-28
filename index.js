@@ -1,7 +1,11 @@
 import { chromium } from 'playwright';
 import express from 'express';
+import cors from 'cors';
 
 const app = express();
+app.use(cors({
+  origin: ['https://fruticola.vercel.app', 'http://localhost:3000'],
+}));
 const PORT = 4000;
 
 async function consultarRucPorDni(dni) {
