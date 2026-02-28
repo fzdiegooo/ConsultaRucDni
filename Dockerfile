@@ -17,6 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     libxshmfence1 \
     libx11-xcb1 \
+    libxfixes3 \
+    libxext6 \
     fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
