@@ -1,62 +1,119 @@
-import { chromium } from 'playwright';
-import express from 'express';
-import cors from 'cors';
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
+import * as cheerio from "cheerio";
 
 const app = express();
-app.use(cors({
-  origin: ['https://fruticola.vercel.app', 'http://localhost:3000'],
-}));
+
+app.use(
+  cors({
+    origin: ["https://fruticola.vercel.app", "http://localhost:3000"],
+  })
+);
+
 const PORT = 4000;
 
+let cookie = null;
+let cookieTime = 0;
+
+/* ----------- CONFIG ----------- */
+
+const DELAY_MS = 1000; // 1.2s entre consultas
+let queue = Promise.resolve();
+
+/* ----------- UTILS ----------- */
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/* ----------- SESION SUNAT ----------- */
+
+async function obtenerSesion() {
+  const res = await fetch(
+    "https://e-consultaruc.sunat.gob.pe/cl-ti-itmrconsruc/FrameCriterioBusquedaWeb.jsp"
+  );
+
+  cookie = res.headers.get("set-cookie");
+  cookieTime = Date.now();
+}
+
+/* ----------- SCRAPER ----------- */
+
 async function consultarRucPorDni(dni) {
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    locale: 'es-PE',
-  });
-  const page = await context.newPage();
-
   try {
-    await page.goto('https://e-consultaruc.sunat.gob.pe/cl-ti-itmrconsruc/FrameCriterioBusquedaWeb.jsp');
-    await page.click('#btnPorDocumento');
-    await page.fill('#txtNumeroDocumento', dni);
-    await page.click('#btnAceptar');
+    if (!cookie || Date.now() - cookieTime > 10 * 60 * 1000) {
+      await obtenerSesion();
+    }
 
-    await page.waitForSelector('.aRucs', { timeout: 6000 });
+    const res = await fetch(
+      "https://e-consultaruc.sunat.gob.pe/cl-ti-itmrconsruc/jcrS00Alias",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          cookie,
+          "user-agent":
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        },
+        body: new URLSearchParams({
+          accion: "consPorTipdoc",
+          tipdoc: "1",
+          nrodoc: dni,
+        }),
+      }
+    );
 
-    const resultado = await page.$eval('.aRucs', (el) => {
-      const headings = el.querySelectorAll('h4.list-group-item-heading');
-      const textos = el.querySelectorAll('p.list-group-item-text');
+    const html = await res.text();
 
-      const rucText = headings[0]?.textContent?.replace('RUC:', '').trim() || null;
-      const nombre = headings[1]?.textContent?.trim() || null;
-      const ubicacion = textos[0]?.textContent?.replace('Ubicación:', '').trim() || null;
-      const estado = textos[1]?.querySelector('span')?.textContent?.trim() || null;
+    const $ = cheerio.load(html);
 
-      return { ruc: rucText, nombre, ubicacion, estado };
-    });
+    const headings = $("h4.list-group-item-heading");
+    const textos = $("p.list-group-item-text");
 
-    return resultado;
+    const ruc = headings.eq(0).text().replace("RUC:", "").trim() || null;
+    const nombre = headings.eq(1).text().trim() || null;
+    const ubicacion =
+      textos.eq(0).text().replace("Ubicación:", "").trim() || null;
+    const estado = textos.eq(1).find("span").text().trim() || null;
+
+    if (!ruc) return null;
+
+    return { ruc, nombre, ubicacion, estado };
   } catch (error) {
-    console.error('Error:', error.message);
+    console.error("Error:", error.message);
     return null;
-  } finally {
-    await browser.close();
   }
 }
 
-app.get('/consulta/:dni', async (req, res) => {
+/* ----------- COLA ----------- */
+
+function encolarConsulta(fn) {
+  const result = queue.then(async () => {
+    const data = await fn();
+    await delay(DELAY_MS);
+    return data;
+  });
+
+  queue = result.catch(() => {}); // evita romper la cola
+  return result;
+}
+
+/* ----------- API ----------- */
+
+app.get("/consulta/:dni", async (req, res) => {
   const { dni } = req.params;
 
   if (!/^\d{8}$/.test(dni)) {
-    return res.status(400).json({ error: 'El DNI debe tener 8 dígitos' });
+    return res.status(400).json({ error: "El DNI debe tener 8 dígitos" });
   }
 
-  const resultado = await consultarRucPorDni(dni);
+  const resultado = await encolarConsulta(() => consultarRucPorDni(dni));
 
   if (!resultado) {
-    return res.status(404).json({ error: 'No se encontró información para el DNI proporcionado' });
+    return res
+      .status(404)
+      .json({ error: "No se encontró información para el DNI proporcionado" });
   }
 
   res.json(resultado);
