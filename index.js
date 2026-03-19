@@ -35,6 +35,81 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function limpiarTexto(texto = "") {
+  return texto.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function extraerEstadoDesdeDetalle(htmlDetalle) {
+  const $ = cheerio.load(htmlDetalle);
+  let estadoDetalle = null;
+
+  $(".list-group-item").each((_, item) => {
+    const titulo = limpiarTexto(
+      $(item).find("h4.list-group-item-heading").first().text()
+    ).toUpperCase();
+
+    if (titulo.includes("ESTADO DEL CONTRIBUYENTE")) {
+      const textoEstado = limpiarTexto(
+        $(item).find("p.list-group-item-text").first().text()
+      );
+      estadoDetalle = limpiarTexto(textoEstado.replace(/Fecha de Baja:.*/i, ""));
+      return false;
+    }
+  });
+
+  return estadoDetalle || null;
+}
+
+async function obtenerEstadoDetalleRuc({ ruc, numRnd, reqId }) {
+  try {
+    const postBody = new URLSearchParams({
+      accion: "consPorRuc",
+      actReturn: "1",
+      nroRuc: ruc,
+      numRnd: numRnd || "",
+      modo: "1",
+    }).toString();
+
+    const { stdout: htmlDetalle } = await execFileAsync("curl", [
+      "-s",
+      "-b", COOKIE_FILE,
+      "-c", COOKIE_FILE,
+      "-H", `User-Agent: ${UA}`,
+      "-H", "Referer: https://e-consultaruc.sunat.gob.pe/cl-ti-itmrconsruc/jcrS00Alias",
+      "-H", "Content-Type: application/x-www-form-urlencoded",
+      "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "-d", postBody,
+      "https://e-consultaruc.sunat.gob.pe/cl-ti-itmrconsruc/jcrS00Alias",
+    ]);
+
+    const esError =
+      htmlDetalle.includes("Pagina de Error") ||
+      htmlDetalle.includes("Request Rejected") ||
+      htmlDetalle.length < 1000;
+
+    if (esError) {
+      console.warn(
+        `[CONSULTA #${reqId}] ⚠ No se pudo abrir detalle del RUC ${ruc} (respuesta inválida)`
+      );
+      return null;
+    }
+
+    const estadoDetalle = extraerEstadoDesdeDetalle(htmlDetalle);
+    if (estadoDetalle) {
+      console.log(
+        `[CONSULTA #${reqId}] ✔ Estado desde detalle RUC ${ruc}: ${estadoDetalle}`
+      );
+    }
+
+    return estadoDetalle;
+  } catch (error) {
+    console.warn(
+      `[CONSULTA #${reqId}] ⚠ Error al consultar detalle del RUC ${ruc}: ${error.message}`
+    );
+    return null;
+  }
+}
+
 /* ----------- SESION SUNAT ----------- */
 
 async function obtenerSesion() {
@@ -119,7 +194,12 @@ async function consultarRucPorDni(dni) {
       const nombre = headings.eq(1).text().trim() || null;
       const ubicacion =
         textos.eq(0).text().replace("Ubicación:", "").trim() || null;
-      const estado = textos.eq(1).find("span").text().trim() || null;
+      const estadoResumen = textos.eq(1).find("span").text().trim() || null;
+
+      const numRnd =
+        $("form[name='selecXNroRuc'] input[name='numRnd']").attr("value") || "";
+      const estadoDetalle = await obtenerEstadoDetalleRuc({ ruc, numRnd, reqId });
+      const estado = estadoDetalle || estadoResumen;
 
       const totalElapsed = Date.now() - startTime;
 
@@ -131,7 +211,7 @@ async function consultarRucPorDni(dni) {
       }
 
       console.log(
-        `[CONSULTA #${reqId}] ✔ Resultado: RUC=${ruc} | Nombre=${nombre} | Estado=${estado} | ${totalElapsed}ms`
+        `[CONSULTA #${reqId}] ✔ Resultado: RUC=${ruc} | Nombre=${nombre} | Estado=${estado} | Estado resumen=${estadoResumen} | ${totalElapsed}ms`
       );
       return { ruc, nombre, ubicacion, estado };
     }
