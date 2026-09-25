@@ -93,7 +93,37 @@ function extraerEstadoDesdeDetalle(htmlDetalle) {
   return estadoDetalle || null;
 }
 
-async function obtenerEstadoDetalleRuc({ ruc, numRnd, reqId }) {
+// SUNAT rechaza de forma intermitente (~50%) el POST de detalle con
+// "Surgieron problemas al procesar la consulta por número de ruc". numRnd es de
+// un solo uso, así que cada reintento pide el listado otra vez para obtener uno nuevo.
+const MAX_INTENTOS_DETALLE = 4;
+
+function extraerNumRnd(htmlListado) {
+  const $ = cheerio.load(htmlListado);
+  return $("form[name='selecXNroRuc'] input[name='numRnd']").attr("value") || "";
+}
+
+async function obtenerEstadoDetalleRuc({ dni, ruc, numRnd, reqId }) {
+  for (let intento = 1; intento <= MAX_INTENTOS_DETALLE; intento++) {
+    if (intento > 1) {
+      await delay(500);
+      try {
+        numRnd = extraerNumRnd(await postListadoPorDni(dni));
+      } catch (error) {
+        console.warn(
+          `[CONSULTA #${reqId}] ⚠ Error al renovar numRnd: ${error.message.split("\n")[0]}`
+        );
+        continue;
+      }
+    }
+
+    const estado = await intentarDetalleRuc({ ruc, numRnd, reqId, intento });
+    if (estado) return estado;
+  }
+  return null;
+}
+
+async function intentarDetalleRuc({ ruc, numRnd, reqId, intento }) {
   try {
     const postBody = new URLSearchParams({
       accion: "consPorRuc",
@@ -127,7 +157,7 @@ async function obtenerEstadoDetalleRuc({ ruc, numRnd, reqId }) {
 
     if (esError) {
       console.warn(
-        `[CONSULTA #${reqId}] ⚠ No se pudo abrir detalle del RUC ${ruc} (respuesta inválida)`
+        `[CONSULTA #${reqId}] ⚠ No se pudo abrir detalle del RUC ${ruc} (intento ${intento}/${MAX_INTENTOS_DETALLE}, respuesta inválida)`
       );
       return null;
     }
@@ -176,6 +206,26 @@ async function obtenerSesion() {
 
 /* ----------- SCRAPER ----------- */
 
+async function postListadoPorDni(dni) {
+  const { stdout } = await execFileAsync(
+    "curl",
+    [
+      "-s",
+      ...CURL_TIMEOUT,
+      "-b", COOKIE_FILE,
+      "-c", COOKIE_FILE,
+      "-H", `User-Agent: ${UA}`,
+      "-H", "Referer: https://e-consultaruc.sunat.gob.pe/cl-ti-itmrconsruc/FrameCriterioBusquedaWeb.jsp",
+      "-H", "Content-Type: application/x-www-form-urlencoded",
+      "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "-d", `accion=consPorTipdoc&tipdoc=1&nrodoc=${dni}&contexto=ti-it&modo=1&token=&search1=&search2=&search3=&nroRuc=&razSoc=`,
+      "https://e-consultaruc.sunat.gob.pe/cl-ti-itmrconsruc/jcrS00Alias",
+    ],
+    EXEC_OPTS
+  );
+  return stdout;
+}
+
 // Devuelve null cuando SUNAT respondió bien pero el DNI no tiene RUC.
 // Lanza cuando SUNAT falló (timeout, WAF, error de red): eso no se cachea.
 async function consultarRucPorDni(dni) {
@@ -205,22 +255,7 @@ async function consultarRucPorDni(dni) {
 
     let html;
     try {
-      ({ stdout: html } = await execFileAsync(
-        "curl",
-        [
-          "-s",
-          ...CURL_TIMEOUT,
-          "-b", COOKIE_FILE,
-          "-c", COOKIE_FILE,
-          "-H", `User-Agent: ${UA}`,
-          "-H", "Referer: https://e-consultaruc.sunat.gob.pe/cl-ti-itmrconsruc/FrameCriterioBusquedaWeb.jsp",
-          "-H", "Content-Type: application/x-www-form-urlencoded",
-          "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "-d", `accion=consPorTipdoc&tipdoc=1&nrodoc=${dni}&contexto=ti-it&modo=1&token=&search1=&search2=&search3=&nroRuc=&razSoc=`,
-          "https://e-consultaruc.sunat.gob.pe/cl-ti-itmrconsruc/jcrS00Alias",
-        ],
-        EXEC_OPTS
-      ));
+      html = await postListadoPorDni(dni);
     } catch (error) {
       const elapsed = Date.now() - startTime;
       console.warn(
@@ -279,10 +314,15 @@ async function consultarRucPorDni(dni) {
       textos.eq(0).text().replace("Ubicación:", "").trim() || null;
     const estadoResumen = textos.eq(1).find("span").text().trim() || null;
 
-    const numRnd =
-      $("form[name='selecXNroRuc'] input[name='numRnd']").attr("value") || "";
-    const estadoDetalle = await obtenerEstadoDetalleRuc({ ruc, numRnd, reqId });
-    const estado = estadoDetalle || estadoResumen;
+    // El estado del listado por DNI no es confiable (muestra ACTIVO en RUCs con
+    // BAJA DEFINITIVA). Sin detalle fallamos sin cachear en vez de devolver un estado falso.
+    const numRnd = extraerNumRnd(html);
+    const estado = await obtenerEstadoDetalleRuc({ dni, ruc, numRnd, reqId });
+    if (!estado) {
+      throw new Error(
+        `No se pudo obtener el estado del RUC ${ruc} tras ${MAX_INTENTOS_DETALLE} intentos`
+      );
+    }
 
     const totalElapsed = Date.now() - startTime;
     console.log(
